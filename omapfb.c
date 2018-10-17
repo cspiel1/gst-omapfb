@@ -29,7 +29,7 @@
 
 #define ROUND_UP(num, scale) (((num) + ((scale) - 1)) & ~((scale) - 1))
 
-static void *parent_class;
+static GstElementClass *parent_class = NULL;
 
 #ifndef GST_DISABLE_GST_DEBUG
 GstDebugCategory *omapfb_debug;
@@ -49,6 +49,21 @@ enum
 	PROP_RENDER_H
 };
 
+static int fb_used = 0;
+GMutex fb_used_lock;
+
+#define FB_USED_MUTEX_LOCK() G_STMT_START {                               \
+    GST_LOG ("locking fb_used from thread %p", g_thread_self ());         \
+    g_mutex_lock (&fb_used_lock);					                      \
+    GST_LOG ("locked fb_used from thread %p", g_thread_self ());          \
+} G_STMT_END
+
+#define FB_USED_MUTEX_UNLOCK() G_STMT_START {                             \
+    GST_LOG ("unlocking fb_used from thread %p", g_thread_self ());		  \
+    g_mutex_unlock (&fb_used_lock);                                       \
+} G_STMT_END
+
+
 struct gst_omapfb_sink {
 	GstBaseSink parent;
 
@@ -60,6 +75,8 @@ struct gst_omapfb_sink {
 	guint32 fourcc;
 
 	int overlay_fd;
+	short devid;
+	const char *dev;
 	unsigned char *framebuffer;
 	bool enabled;
 	bool manual_update;
@@ -167,6 +184,8 @@ static struct page *get_page(struct gst_omapfb_sink *self)
 {
 	struct page *page = NULL;
 	int i;
+	if (!self->pages)
+		return NULL;
 	for (i = 0; i < self->nr_pages; i++) {
 		if (&self->pages[i] == self->cur_page)
 			continue;
@@ -214,6 +233,10 @@ setup_plane(struct gst_omapfb_sink *self)
 /*    struct omapfb_color_key color_key;*/
 	size_t framesize;
 
+	if (self->mem_info.size && munmap(self->framebuffer, self->mem_info.size)) {
+		pr_err(self, "could not unmap %s", strerror(errno));
+	}
+
 	self->plane_info.enabled = 0;
 	if (ioctl(self->overlay_fd, OMAPFB_SETUP_PLANE, &self->plane_info)) {
 		pr_err(self, "could not disable plane");
@@ -226,12 +249,14 @@ setup_plane(struct gst_omapfb_sink *self)
 	self->mem_info.size = framesize * self->nr_pages;
 
 	if (ioctl(self->overlay_fd, OMAPFB_SETUP_MEM, &self->mem_info)) {
-		pr_err(self, "could not setup memory info");
+		self->mem_info.size = 0;
+		pr_err(self, "could not setup memory info %dx%d", self->width, self->height);
 		return false;
 	}
 
 	self->framebuffer = mmap(NULL, self->mem_info.size, PROT_WRITE, MAP_SHARED, self->overlay_fd, 0);
 	if (self->framebuffer == MAP_FAILED) {
+		self->mem_info.size = 0;
 		pr_err(self, "memory map failed");
 		return false;
 	}
@@ -306,6 +331,8 @@ setup_plane(struct gst_omapfb_sink *self)
 	self->manual_update = (update_mode == OMAPFB_MANUAL_UPDATE);
 
 	self->pages = calloc(self->nr_pages, sizeof(*self->pages));
+	if (!self->pages)
+		return false;
 
 	int i;
 	for (i = 0; i < self->nr_pages; i++) {
@@ -381,12 +408,47 @@ setcaps(GstBaseSink *base, GstCaps *caps)
 static gboolean
 start(GstBaseSink *base)
 {
-	struct gst_omapfb_sink *self = (struct gst_omapfb_sink *)base;
+	(void) base;
+	return true;
+}
+
+static gboolean
+stop(GstBaseSink *base)
+{
+	(void) base;
+	return true;
+}
+
+static gboolean
+start_video(struct gst_omapfb_sink *self)
+{
+	self->dev = NULL;
 
 	self->nr_pages = 4;
 	self->cur_page = self->old_page = NULL;
+	self->mem_info.size = 0;
 
-	self->overlay_fd = open("/dev/fb1", O_RDWR);
+	FB_USED_MUTEX_LOCK();
+	if ((fb_used & 1) == 0) {
+		self->dev = "/dev/fb1";
+		self->devid = 1;
+	} else {
+		self->dev = "/dev/fb2";
+		self->devid = 2;
+	}
+	if (fb_used >=3)
+		fb_used++;
+	else
+		fb_used |= self->devid;
+	FB_USED_MUTEX_UNLOCK();
+
+	if (fb_used > 3) {
+		pr_err(self, "more than two video framebuffer are used");
+		/* We hope this will be only for a short time and proceed. */
+	}
+
+	printf("%s We open %s.\n", __PRETTY_FUNCTION__, self->dev);
+	self->overlay_fd = open(self->dev, O_RDWR);
 
 	if (self->overlay_fd == -1) {
 		pr_err(self, "could not open overlay");
@@ -407,22 +469,21 @@ start(GstBaseSink *base)
 }
 
 static gboolean
-stop(GstBaseSink *base)
+stop_video(struct gst_omapfb_sink* self)
 {
-	struct gst_omapfb_sink *self = (struct gst_omapfb_sink *)base;
 
-/*    if (self->enabled) {*/
-/*        self->plane_info.enabled = 0;*/
+	if (self->enabled) {
+		self->enabled = false;
+		self->plane_info.enabled = 0;
 
-/*        if (ioctl(self->overlay_fd, OMAPFB_SETUP_PLANE, &self->plane_info)) {*/
-/*            pr_err(self, "could not disable plane");*/
-/*            return false;*/
-/*        }*/
-/*    }*/
+		if (ioctl(self->overlay_fd, OMAPFB_SETUP_PLANE, &self->plane_info)) {
+			pr_err(self, "could not disable plane");
+			return false;
+		}
+	}
 
 	if (munmap(self->framebuffer, self->mem_info.size)) {
-		pr_err(self, "could not unmap");
-		return false;
+		pr_err(self, "could not unmap %s", strerror(errno));
 	}
 
 	if (close(self->overlay_fd)) {
@@ -430,7 +491,51 @@ stop(GstBaseSink *base)
 		return false;
 	}
 
+	FB_USED_MUTEX_LOCK();
+	if (fb_used>3)
+		fb_used--;
+	else
+		fb_used -= self->devid;
+
+	printf("%s We close %s. fb_used=%d\n", __PRETTY_FUNCTION__, self->dev, fb_used);
+	FB_USED_MUTEX_UNLOCK();
 	return true;
+}
+
+static GstStateChangeReturn
+change_state (GstElement * element, GstStateChange transition)
+{
+  GstStateChangeReturn ret = GST_STATE_CHANGE_SUCCESS;
+  struct gst_omapfb_sink *self = (struct gst_omapfb_sink *)element;
+
+  switch (transition) {
+    case GST_STATE_CHANGE_NULL_TO_READY:
+      break;
+    case GST_STATE_CHANGE_READY_TO_PAUSED:
+	  start_video(self);
+      break;
+    case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
+      break;
+    case GST_STATE_CHANGE_PAUSED_TO_READY:
+      break;
+    default:
+      break;
+  }
+
+  ret = GST_ELEMENT_CLASS (parent_class)->change_state (element, transition);
+
+  switch (transition) {
+    case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
+      break;
+    case GST_STATE_CHANGE_PAUSED_TO_READY:
+	  stop_video(self);
+      break;
+    case GST_STATE_CHANGE_READY_TO_NULL:
+      break;
+    default:
+      break;
+  }
+  return ret;
 }
 
 static GstFlowReturn
@@ -441,6 +546,8 @@ render(GstBaseSink *base, GstBuffer *buffer)
 	int i;
 
 	if (self->fourcc!=GST_MAKE_FOURCC('I', '4', '2', '0')) {
+		if (!self->pages)
+			return GST_FLOW_ERROR;
 		for (i = 0; i < self->nr_pages; i++) {
 			if (self->pages[i].buf == GST_BUFFER_DATA(buffer)) {
 				page = &self->pages[i];
@@ -453,6 +560,8 @@ render(GstBaseSink *base, GstBuffer *buffer)
 		page = get_page(self);
 		if (!page)
 			page = self->cur_page; /* not ok, but last resort */
+		if (!page)
+			return GST_FLOW_ERROR;
 
 		if (self->fourcc==GST_MAKE_FOURCC('I', '4', '2', '0')) {
 			int src_y_pitch = (self->width + 3) & ~3;
@@ -522,18 +631,23 @@ static void
 class_init(void *g_class, void *class_data)
 {
 	GstBaseSinkClass *base_sink_class;
+	GstElementClass *gstelement_class;
 	GObjectClass *gobject_class;
 
 	base_sink_class = g_class;
 
-	parent_class = g_type_class_ref(GST_OMAPFB_SINK_TYPE);
+	parent_class = g_type_class_peek_parent (g_class);
 
 	base_sink_class->set_caps = setcaps;
 	base_sink_class->buffer_alloc = buffer_alloc;
-	base_sink_class->start = start;
-	base_sink_class->stop = stop;
+    base_sink_class->start = start;
+    base_sink_class->stop = stop;
 	base_sink_class->render = render;
 	base_sink_class->preroll = render;
+
+	gstelement_class = (GstElementClass *) g_class;
+	gstelement_class->change_state =
+		GST_DEBUG_FUNCPTR (change_state);
 
 	gobject_class = (GObjectClass *) g_class;
 	gobject_class->set_property = gst_omapfb_sink_set_property;

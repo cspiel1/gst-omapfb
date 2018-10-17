@@ -362,6 +362,38 @@ stop(GstBaseSink *base)
 }
 
 static gboolean
+hide_framebuffer(struct gst_omapfb_sink *self, const char* fb)
+{
+	bool do_open = self->overlay_fd == 0;
+	if (do_open) {
+		self->overlay_fd = open(fb, O_RDWR);
+
+		if (self->overlay_fd == -1) {
+			pr_err(self, "could not open overlay %s", fb);
+			return false;
+		}
+	}
+
+	if (ioctl(self->overlay_fd, OMAPFB_QUERY_PLANE, &self->plane_info)) {
+		pr_err(self, "could not query plane info for %s", fb);
+		return false;
+	}
+
+	self->plane_info.enabled = 0;
+	if (ioctl(self->overlay_fd, OMAPFB_SETUP_PLANE, &self->plane_info)) {
+		pr_err(self, "could not disable plane %s", fb);
+		return false;
+	}
+
+	if (do_open) {
+		close(self->overlay_fd);
+		self->overlay_fd = 0;
+	}
+
+	return true;
+}
+
+static gboolean
 start_video(struct gst_omapfb_sink *self)
 {
 	self->dev = NULL;
@@ -695,6 +727,9 @@ gst_omapfb_sink_init (struct gst_omapfb_sink * omapfbsink)
   omapfbsink->render_rect.h = 0;
   omapfbsink->have_render_rect = false;
   omapfbsink->render_rect_changed = false;
+  omapfbsink->overlay_fd = 0;
+  hide_framebuffer(omapfbsink, "/dev/fb1");
+  hide_framebuffer(omapfbsink, "/dev/fb2");
 }
 
 GType

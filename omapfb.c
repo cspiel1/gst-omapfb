@@ -35,12 +35,6 @@ static GstElementClass *parent_class = NULL;
 GstDebugCategory *omapfb_debug;
 #endif
 
-struct page {
-	unsigned yoffset;
-	void *buf;
-	bool used;
-};
-
 enum
 {
 	PROP_RENDER_X = 1,
@@ -80,11 +74,6 @@ struct gst_omapfb_sink {
 	unsigned char *framebuffer;
 	bool enabled;
 	bool manual_update;
-
-	struct page *pages;
-	int nr_pages;
-	struct page *cur_page;
-	struct page *old_page;
 
 	/* target video rectangle */
 	GstVideoRectangle render_rect;
@@ -180,30 +169,6 @@ update(struct gst_omapfb_sink *self)
 	ioctl(self->overlay_fd, OMAPFB_UPDATE_WINDOW, &update_window);
 }
 
-static struct page *get_page(struct gst_omapfb_sink *self)
-{
-	struct page *page = NULL;
-	int i;
-	if (!self->pages)
-		return NULL;
-	for (i = 0; i < self->nr_pages; i++) {
-		if (&self->pages[i] == self->cur_page)
-			continue;
-		if (&self->pages[i] == self->old_page)
-			continue;
-		if (!self->pages[i].used) {
-			page = &self->pages[i];
-			break;
-		}
-	}
-	/* old page needs a vsync */
-	if (!page && self->old_page && !self->old_page->used)
-		page = self->old_page;
-	if (page)
-		page->used = true;
-	return page;
-}
-
 static bool
 check_render_rect(struct gst_omapfb_sink *self)
 {
@@ -246,7 +211,7 @@ setup_plane(struct gst_omapfb_sink *self)
 	framesize = GST_ROUND_UP_2(self->width) * self->height * 2;
 
 	self->mem_info.type = OMAPFB_MEMTYPE_SDRAM;
-	self->mem_info.size = framesize * self->nr_pages;
+	self->mem_info.size = framesize;
 
 	if (ioctl(self->overlay_fd, OMAPFB_SETUP_MEM, &self->mem_info)) {
 		self->mem_info.size = 0;
@@ -264,7 +229,7 @@ setup_plane(struct gst_omapfb_sink *self)
 	self->overlay_info.xres = self->width;
 	self->overlay_info.yres = self->height;
 	self->overlay_info.xres_virtual = self->overlay_info.xres;
-	self->overlay_info.yres_virtual = self->overlay_info.yres * self->nr_pages;
+	self->overlay_info.yres_virtual = self->overlay_info.yres;
 
 	self->overlay_info.xoffset = 0;
 	self->overlay_info.yoffset = 0;
@@ -330,17 +295,6 @@ setup_plane(struct gst_omapfb_sink *self)
 	ioctl(self->overlay_fd, OMAPFB_SET_UPDATE_MODE, &update_mode);
 	self->manual_update = (update_mode == OMAPFB_MANUAL_UPDATE);
 
-	self->pages = calloc(self->nr_pages, sizeof(*self->pages));
-	if (!self->pages)
-		return false;
-
-	int i;
-	for (i = 0; i < self->nr_pages; i++) {
-		self->pages[i].yoffset = i * self->overlay_info.yres;
-		self->pages[i].buf = self->framebuffer + (i * framesize);
-	}
-	self->cur_page = &self->pages[0];
-
 	return true;
 }
 
@@ -367,28 +321,16 @@ buffer_alloc(GstBaseSink *base, guint64 offset, guint size, GstCaps *caps, GstBu
 {
 	struct gst_omapfb_sink *self = (struct gst_omapfb_sink *)base;
 	GstBuffer *buffer;
-	struct page *page;
 
 	if (!self->enabled && !setup(self, caps))
 		goto missing;
 
-	page = get_page(self);
-	if (!page)
-		goto missing;
-
-	if (self->fourcc==GST_MAKE_FOURCC('I', '4', '2', '0')) {
-		buffer = gst_buffer_new_and_alloc(size);
-	} else {
-		buffer = gst_buffer_new();
-		GST_BUFFER_DATA(buffer) = (guint8*) page->buf;
-		GST_BUFFER_SIZE(buffer) = size;
-	}
+	buffer = gst_buffer_new_and_alloc(size);
 	gst_buffer_set_caps(buffer, caps);
 
 	*buf = buffer;
 
-	if (page == self->old_page)
-		ioctl(self->overlay_fd, OMAPFB_WAITFORVSYNC);
+/*    ioctl(self->overlay_fd, OMAPFB_WAITFORVSYNC);*/
 
 	return GST_FLOW_OK;
 missing:
@@ -424,8 +366,6 @@ start_video(struct gst_omapfb_sink *self)
 {
 	self->dev = NULL;
 
-	self->nr_pages = 4;
-	self->cur_page = self->old_page = NULL;
 	self->mem_info.size = 0;
 
 	FB_USED_MUTEX_LOCK();
@@ -542,47 +482,21 @@ static GstFlowReturn
 render(GstBaseSink *base, GstBuffer *buffer)
 {
 	struct gst_omapfb_sink *self = (struct gst_omapfb_sink *)base;
-	struct page *page = NULL;
-	int i;
 
-	if (self->fourcc!=GST_MAKE_FOURCC('I', '4', '2', '0')) {
-		if (!self->pages)
-			return GST_FLOW_ERROR;
-		for (i = 0; i < self->nr_pages; i++) {
-			if (self->pages[i].buf == GST_BUFFER_DATA(buffer)) {
-				page = &self->pages[i];
-				break;
-			}
-		}
-	}
-
-	if (!page) {
-		page = get_page(self);
-		if (!page)
-			page = self->cur_page; /* not ok, but last resort */
-		if (!page)
-			return GST_FLOW_ERROR;
-
-		if (self->fourcc==GST_MAKE_FOURCC('I', '4', '2', '0')) {
-			int src_y_pitch = (self->width + 3) & ~3;
-			int src_uv_pitch = (((src_y_pitch >> 1) + 3) & ~3);
-			guint8 *yb = GST_BUFFER_DATA(buffer);
-			guint8 *ub = yb + (src_y_pitch * self->height);
-			guint8 *vb = ub + (src_uv_pitch * (self->height / 2));
-			uv12_to_uyvy(self->width & ~15,
-			             self->height & ~15,
-			             src_y_pitch,
-			             src_uv_pitch,
-			             yb, ub, vb,
-			             (guint8*) page->buf);
-		} else {
-			memcpy(page->buf, GST_BUFFER_DATA(buffer), GST_BUFFER_SIZE(buffer));
-		}
-	}
-
-	if (page != self->cur_page) {
-		self->overlay_info.yoffset = page->yoffset;
-		ioctl(self->overlay_fd, FBIOPAN_DISPLAY, &self->overlay_info);
+	if (self->fourcc==GST_MAKE_FOURCC('I', '4', '2', '0')) {
+		int src_y_pitch = (self->width + 3) & ~3;
+		int src_uv_pitch = (((src_y_pitch >> 1) + 3) & ~3);
+		guint8 *yb = GST_BUFFER_DATA(buffer);
+		guint8 *ub = yb + (src_y_pitch * self->height);
+		guint8 *vb = ub + (src_uv_pitch * (self->height / 2));
+		uv12_to_uyvy(self->width & ~15,
+				self->height & ~15,
+				src_y_pitch,
+				src_uv_pitch,
+				yb, ub, vb,
+				(guint8*) self->framebuffer);
+	} else {
+		memcpy(self->framebuffer, GST_BUFFER_DATA(buffer), GST_BUFFER_SIZE(buffer));
 	}
 
 	if (self->render_rect_changed) {
@@ -592,10 +506,6 @@ render(GstBaseSink *base, GstBuffer *buffer)
 
 	if (self->manual_update)
 		update(self);
-
-	self->old_page = self->cur_page;
-	self->cur_page = page;
-	page->used = false;
 
 	return GST_FLOW_OK;
 }

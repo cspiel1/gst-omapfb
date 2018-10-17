@@ -1,7 +1,7 @@
 CROSS_COMPILE ?= arm-linux-
 CC := $(CROSS_COMPILE)gcc
 
-CFLAGS := -O2 -ggdb -Wall -Wextra -Wno-unused-parameter -Wmissing-prototypes -ansi -std=c99
+CFLAGS := -O2 -ggdb -Wall -Wextra -Wno-unused-parameter -Wmissing-prototypes -ansi -std=c99 -mfloat-abi=softfp -mfpu=neon
 LDFLAGS := -Wl,--no-undefined -Wl,--as-needed
 
 override CFLAGS += -D_GNU_SOURCE -DGST_DISABLE_DEPRECATED
@@ -19,7 +19,7 @@ D = $(DESTDIR)
 
 # plugin
 
-libgstomapfb.so: omapfb.o log.o
+libgstomapfb.so: omapfb.o log.o image-format-conversions.o
 libgstomapfb.so: override CFLAGS += $(GST_CFLAGS) -fPIC \
 	-D VERSION='"$(version)"' -I./include
 libgstomapfb.so: override LIBS += $(GST_LIBS)

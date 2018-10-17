@@ -25,6 +25,7 @@
 
 #include "omapfb.h"
 #include "log.h"
+#include "image-format-conversions.h"
 
 #define ROUND_UP(num, scale) (((num) + ((scale) - 1)) & ~((scale) - 1))
 
@@ -56,6 +57,7 @@ struct gst_omapfb_sink {
 	struct omapfb_plane_info plane_info;
 	int par_n, par_d;
 	int width, height;
+	guint32 fourcc;
 
 	int overlay_fd;
 	unsigned char *framebuffer;
@@ -114,10 +116,10 @@ generate_sink_template(void)
 		g_value_init(&list, GST_TYPE_LIST);
 		g_value_init(&val, GST_TYPE_FOURCC);
 
-#if 0
 		gst_value_set_fourcc(&val, GST_MAKE_FOURCC('I', '4', '2', '0'));
 		gst_value_list_append_value(&list, &val);
 
+#if 0
 		gst_value_set_fourcc(&val, GST_MAKE_FOURCC('Y', 'U', 'Y', '2'));
 		gst_value_list_append_value(&list, &val);
 
@@ -328,6 +330,8 @@ setup(struct gst_omapfb_sink *self, GstCaps *caps)
 	if (!gst_structure_get_fraction(structure, "pixel-aspect-ratio", &self->par_n, &self->par_d))
 		self->par_n = self->par_d = 1;
 
+	gst_structure_get_fourcc(structure, "format", &self->fourcc);
+
 	return setup_plane(self);
 }
 
@@ -345,9 +349,13 @@ buffer_alloc(GstBaseSink *base, guint64 offset, guint size, GstCaps *caps, GstBu
 	if (!page)
 		goto missing;
 
-	buffer = gst_buffer_new();
-	GST_BUFFER_DATA(buffer) = page->buf;
-	GST_BUFFER_SIZE(buffer) = size;
+	if (self->fourcc==GST_MAKE_FOURCC('I', '4', '2', '0')) {
+		buffer = gst_buffer_new_and_alloc(size);
+	} else {
+		buffer = gst_buffer_new();
+		GST_BUFFER_DATA(buffer) = (guint8*) page->buf;
+		GST_BUFFER_SIZE(buffer) = size;
+	}
 	gst_buffer_set_caps(buffer, caps);
 
 	*buf = buffer;
@@ -432,17 +440,35 @@ render(GstBaseSink *base, GstBuffer *buffer)
 	struct page *page = NULL;
 	int i;
 
-	for (i = 0; i < self->nr_pages; i++)
-		if (self->pages[i].buf == GST_BUFFER_DATA(buffer)) {
-			page = &self->pages[i];
-			break;
+	if (self->fourcc!=GST_MAKE_FOURCC('I', '4', '2', '0')) {
+		for (i = 0; i < self->nr_pages; i++) {
+			if (self->pages[i].buf == GST_BUFFER_DATA(buffer)) {
+				page = &self->pages[i];
+				break;
+			}
 		}
+	}
 
 	if (!page) {
 		page = get_page(self);
 		if (!page)
 			page = self->cur_page; /* not ok, but last resort */
-		memcpy(page->buf, GST_BUFFER_DATA(buffer), GST_BUFFER_SIZE(buffer));
+
+		if (self->fourcc==GST_MAKE_FOURCC('I', '4', '2', '0')) {
+			int src_y_pitch = (self->width + 3) & ~3;
+			int src_uv_pitch = (((src_y_pitch >> 1) + 3) & ~3);
+			guint8 *yb = GST_BUFFER_DATA(buffer);
+			guint8 *ub = yb + (src_y_pitch * self->height);
+			guint8 *vb = ub + (src_uv_pitch * (self->height / 2));
+			uv12_to_uyvy(self->width & ~15,
+			             self->height & ~15,
+			             src_y_pitch,
+			             src_uv_pitch,
+			             yb, ub, vb,
+			             (guint8*) page->buf);
+		} else {
+			memcpy(page->buf, GST_BUFFER_DATA(buffer), GST_BUFFER_SIZE(buffer));
+		}
 	}
 
 	if (page != self->cur_page) {

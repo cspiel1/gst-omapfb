@@ -14,9 +14,11 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 #include <gst/gst.h>
 #include <gst/base/gstbasesink.h>
+#include <gst/video/gstvideosink.h>
 
 #include <linux/fb.h>
 #include <linux/omapfb.h>
@@ -38,13 +40,22 @@ struct page {
 	bool used;
 };
 
+enum
+{
+	PROP_RENDER_X = 1,
+	PROP_RENDER_Y,
+	PROP_RENDER_W,
+	PROP_RENDER_H
+};
+
 struct gst_omapfb_sink {
 	GstBaseSink parent;
 
-	struct fb_var_screeninfo varinfo;
 	struct fb_var_screeninfo overlay_info;
 	struct omapfb_mem_info mem_info;
 	struct omapfb_plane_info plane_info;
+	int par_n, par_d;
+	int width, height;
 
 	int overlay_fd;
 	unsigned char *framebuffer;
@@ -55,11 +66,30 @@ struct gst_omapfb_sink {
 	int nr_pages;
 	struct page *cur_page;
 	struct page *old_page;
+
+	/* target video rectangle */
+	GstVideoRectangle render_rect;
+	gboolean have_render_rect;
+	gboolean render_rect_changed;
 };
 
 struct gst_omapfb_sink_class {
 	GstBaseSinkClass parent_class;
 };
+
+static struct fb_var_screeninfo _varinfo;
+
+#define GST_IS_OMAPFBSINK(obj) \
+  (G_TYPE_CHECK_INSTANCE_TYPE((obj), GST_OMAPFB_SINK_TYPE))
+#define GST_OMAPFBSINK(obj) \
+  (G_TYPE_CHECK_INSTANCE_CAST((obj), GST_OMAPFB_SINK_TYPE, struct gst_omapfb_sink))
+
+static void
+gst_omapfb_sink_set_property (GObject * object, guint prop_id,
+    const GValue * value, GParamSpec * pspec);
+static void
+gst_omapfb_sink_get_property (GObject * object, guint prop_id,
+    GValue * value, GParamSpec * pspec);
 
 static GstCaps *
 generate_sink_template(void)
@@ -116,9 +146,8 @@ update(struct gst_omapfb_sink *self)
 	unsigned x, y, w, h;
 
 	x = y = 0;
-	w = self->varinfo.xres;
-	h = self->varinfo.yres;
-
+	w = _varinfo.xres;
+	h = _varinfo.yres;
 	update_window.x = x;
 	update_window.y = y;
 	update_window.width = w;
@@ -154,23 +183,34 @@ static struct page *get_page(struct gst_omapfb_sink *self)
 	return page;
 }
 
-static gboolean
-setup(struct gst_omapfb_sink *self, GstCaps *caps)
+static bool
+check_render_rect(struct gst_omapfb_sink *self)
 {
-	GstStructure *structure;
-	int width, height;
+  if (self->have_render_rect) {
+	if ((guint) self->render_rect.x > _varinfo.xres-16)
+	  self->render_rect.x = _varinfo.xres-16;
+	if ((guint) self->render_rect.y > _varinfo.yres-16)
+	  self->render_rect.y = _varinfo.yres-16;
+	if ((guint) self->render_rect.x + (guint) self->render_rect.w > _varinfo.xres)
+	  self->render_rect.w = _varinfo.xres - (guint) self->render_rect.x;
+	if ((guint) self->render_rect.y + (guint) self->render_rect.h > _varinfo.yres)
+	  self->render_rect.h = _varinfo.yres - (guint) self->render_rect.y;
+
+	if (!self->render_rect.w || !self->render_rect.h)
+		self->have_render_rect = false;
+  }
+
+  return self->have_render_rect;
+}
+
+static gboolean
+setup_plane(struct gst_omapfb_sink *self)
+{
 	int update_mode;
-	struct omapfb_color_key color_key;
-	size_t framesize;
-	int par_n, par_d;
+	unsigned rx, ry, rw, rh;
 	unsigned out_width, out_height;
-
-	structure = gst_caps_get_structure(caps, 0);
-
-	gst_structure_get_int(structure, "width", &width);
-	gst_structure_get_int(structure, "height", &height);
-	if (!gst_structure_get_fraction(structure, "pixel-aspect-ratio", &par_n, &par_d))
-		par_n = par_d = 1;
+/*    struct omapfb_color_key color_key;*/
+	size_t framesize;
 
 	self->plane_info.enabled = 0;
 	if (ioctl(self->overlay_fd, OMAPFB_SETUP_PLANE, &self->plane_info)) {
@@ -178,7 +218,7 @@ setup(struct gst_omapfb_sink *self, GstCaps *caps)
 		return false;
 	}
 
-	framesize = GST_ROUND_UP_2(width) * height * 2;
+	framesize = GST_ROUND_UP_2(self->width) * self->height * 2;
 
 	self->mem_info.type = OMAPFB_MEMTYPE_SDRAM;
 	self->mem_info.size = framesize * self->nr_pages;
@@ -194,8 +234,8 @@ setup(struct gst_omapfb_sink *self, GstCaps *caps)
 		return false;
 	}
 
-	self->overlay_info.xres = width;
-	self->overlay_info.yres = height;
+	self->overlay_info.xres = self->width;
+	self->overlay_info.yres = self->height;
 	self->overlay_info.xres_virtual = self->overlay_info.xres;
 	self->overlay_info.yres_virtual = self->overlay_info.yres * self->nr_pages;
 
@@ -211,32 +251,46 @@ setup(struct gst_omapfb_sink *self, GstCaps *caps)
 		return false;
 	}
 
-	color_key.key_type = OMAPFB_COLOR_KEY_DISABLED;
-	if (ioctl(self->overlay_fd, OMAPFB_SET_COLOR_KEY, &color_key))
-		pr_err(self, "could not disable color key");
+/*    color_key.key_type = OMAPFB_COLOR_KEY_DISABLED;*/
+/*    if (ioctl(self->overlay_fd, OMAPFB_SET_COLOR_KEY, &color_key))*/
+/*        pr_err(self, "could not disable color key");*/
 
+	if (self->have_render_rect && check_render_rect(self)) {
+	  rw = self->render_rect.w & ~0xf;
+	  rh = self->render_rect.h & ~0xf;
+	  rx = self->render_rect.x + (self->render_rect.w-rw)/2;
+	  ry = self->render_rect.y + (self->render_rect.h-rh)/2;
+	} else  {
+	  rx = 0;
+	  ry = 0;
+	  rw = _varinfo.xres;
+	  rh = _varinfo.yres;
+	}
 	/* scale to width */
-	out_width = self->varinfo.xres;
-	out_height = (height * par_d * self->varinfo.xres + width * par_n / 2) / (width * par_n);
-	if (out_height > self->varinfo.yres) {
+	out_width = rw;
+	out_height =
+		(self->height * self->par_d * rw + self->width * self->par_n/2)
+		/ (self->width * self->par_n);
+	if (out_height > rh) {
 		/* scale to height */
-		out_height = self->varinfo.yres;
-		out_width = (width * par_n * self->varinfo.yres + height * par_d / 2) / (height * par_d);
+		out_height = rh;
+		out_width =
+			(self->width * self->par_n * rh + self->height * self->par_d/2)
+			/ (self->height * self->par_d);
 	}
 	out_width = ROUND_UP(out_width, 2);
 	out_height = ROUND_UP(out_height, 2);
 
 	self->plane_info.enabled = 1;
-	self->plane_info.pos_x = (self->varinfo.xres - out_width) / 2;
-	self->plane_info.pos_y = (self->varinfo.yres - out_height) / 2;
+	self->plane_info.pos_x = rx + (rw - out_width) / 2;
+	self->plane_info.pos_y = ry + (rh - out_height) / 2;
 	self->plane_info.out_width = out_width;
 	self->plane_info.out_height = out_height;
 
-	pr_info(self, "output info: %dx%d, offset: %d,%d",
-			out_width, out_height,
+	printf("plane info: %dx%d, offset: %d,%d\n",
+			self->plane_info.out_width, self->plane_info.out_height,
 			self->plane_info.pos_x, self->plane_info.pos_y);
-	pr_info(self, "plane info: %ux%u",
-			self->varinfo.xres, self->varinfo.yres);
+	printf("render rectangle: %ux%u, offset: %d,%d\n", rw, rh, rx, ry);
 
 	if (ioctl(self->overlay_fd, OMAPFB_SETUP_PLANE, &self->plane_info)) {
 		pr_err(self, "could not setup plane");
@@ -259,6 +313,22 @@ setup(struct gst_omapfb_sink *self, GstCaps *caps)
 	self->cur_page = &self->pages[0];
 
 	return true;
+}
+
+static gboolean
+setup(struct gst_omapfb_sink *self, GstCaps *caps)
+{
+	GstStructure *structure;
+
+	_varinfo = _varinfo;
+	structure = gst_caps_get_structure(caps, 0);
+
+	gst_structure_get_int(structure, "width", &self->width);
+	gst_structure_get_int(structure, "height", &self->height);
+	if (!gst_structure_get_fraction(structure, "pixel-aspect-ratio", &self->par_n, &self->par_d))
+		self->par_n = self->par_d = 1;
+
+	return setup_plane(self);
 }
 
 static GstFlowReturn
@@ -304,28 +374,9 @@ static gboolean
 start(GstBaseSink *base)
 {
 	struct gst_omapfb_sink *self = (struct gst_omapfb_sink *)base;
-	int fd;
 
 	self->nr_pages = 4;
 	self->cur_page = self->old_page = NULL;
-
-	fd = open("/dev/fb0", O_RDWR);
-
-	if (fd == -1) {
-		pr_err(self, "could not open framebuffer");
-		return false;
-	}
-
-	if (ioctl(fd, FBIOGET_VSCREENINFO, &self->varinfo)) {
-		pr_err(self, "could not get screen info");
-		close(fd);
-		return false;
-	}
-
-	if (close(fd)) {
-		pr_err(self, "could not close framebuffer");
-		return false;
-	}
 
 	self->overlay_fd = open("/dev/fb1", O_RDWR);
 
@@ -352,14 +403,14 @@ stop(GstBaseSink *base)
 {
 	struct gst_omapfb_sink *self = (struct gst_omapfb_sink *)base;
 
-	if (self->enabled) {
-		self->plane_info.enabled = 0;
+/*    if (self->enabled) {*/
+/*        self->plane_info.enabled = 0;*/
 
-		if (ioctl(self->overlay_fd, OMAPFB_SETUP_PLANE, &self->plane_info)) {
-			pr_err(self, "could not disable plane");
-			return false;
-		}
-	}
+/*        if (ioctl(self->overlay_fd, OMAPFB_SETUP_PLANE, &self->plane_info)) {*/
+/*            pr_err(self, "could not disable plane");*/
+/*            return false;*/
+/*        }*/
+/*    }*/
 
 	if (munmap(self->framebuffer, self->mem_info.size)) {
 		pr_err(self, "could not unmap");
@@ -399,6 +450,11 @@ render(GstBaseSink *base, GstBuffer *buffer)
 		ioctl(self->overlay_fd, FBIOPAN_DISPLAY, &self->overlay_info);
 	}
 
+	if (self->render_rect_changed) {
+		self->render_rect_changed = false;
+		setup_plane(self);
+	}
+
 	if (self->manual_update)
 		update(self);
 
@@ -409,10 +465,38 @@ render(GstBaseSink *base, GstBuffer *buffer)
 	return GST_FLOW_OK;
 }
 
+static bool
+init_varinfo()
+{
+	int fd;
+	fd = open("/dev/fb0", O_RDWR);
+
+	_varinfo.xres = G_MAXUINT;
+	_varinfo.yres = G_MAXUINT;
+	if (fd == -1) {
+		fprintf(stderr, "omapfbsink: could not open framebuffer\n");
+		return false;
+	}
+
+	if (ioctl(fd, FBIOGET_VSCREENINFO, &_varinfo)) {
+		fprintf(stderr, "omapfbsink: could not get screen info\n");
+		close(fd);
+		return false;
+	}
+
+	if (close(fd)) {
+		fprintf(stderr, "omapfbsink: could not close framebuffer\n");
+		return false;
+	}
+
+	return true;
+}
+
 static void
 class_init(void *g_class, void *class_data)
 {
 	GstBaseSinkClass *base_sink_class;
+	GObjectClass *gobject_class;
 
 	base_sink_class = g_class;
 
@@ -424,6 +508,33 @@ class_init(void *g_class, void *class_data)
 	base_sink_class->stop = stop;
 	base_sink_class->render = render;
 	base_sink_class->preroll = render;
+
+	gobject_class = (GObjectClass *) g_class;
+	gobject_class->set_property = gst_omapfb_sink_set_property;
+	gobject_class->get_property = gst_omapfb_sink_get_property;
+
+	init_varinfo();
+
+	g_object_class_install_property (gobject_class, PROP_RENDER_X,
+			g_param_spec_uint ("render-x", "Render X-pos.",
+				"The X-Position of the render rectangle.",
+				0, _varinfo.xres-8, 0,
+				G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
+	g_object_class_install_property (gobject_class, PROP_RENDER_Y,
+			g_param_spec_uint ("render-y", "Render Y-pos.",
+				"The Y-Position of the render rectangle.",
+				0, _varinfo.yres-8, 0,
+				G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
+	g_object_class_install_property (gobject_class, PROP_RENDER_W,
+			g_param_spec_uint ("render-width", "Render width.",
+				"The width of the render rectangle.",
+				0,  _varinfo.xres, 0,
+				G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
+	g_object_class_install_property (gobject_class, PROP_RENDER_H,
+			g_param_spec_uint ("render-height", "Render height.",
+				"The height of the render rectangle.",
+				0, _varinfo.yres, 0,
+				G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
 }
 
 static void
@@ -447,6 +558,95 @@ base_init(void *g_class)
 	gst_object_unref(template);
 }
 
+static void
+gst_omapfb_sink_set_property (GObject * object, guint prop_id,
+    const GValue * value, GParamSpec * pspec)
+{
+  struct gst_omapfb_sink *osink;
+  GstVideoRectangle old_rect;
+  int x, y, w, h;
+
+  g_return_if_fail (GST_IS_OMAPFBSINK (object));
+  osink = GST_OMAPFBSINK (object);
+  old_rect = osink->render_rect;
+
+  switch (prop_id) {
+    case PROP_RENDER_X:
+	  x = (int) g_value_get_uint (value);
+	  osink->render_rect_changed |= (old_rect.x!=x);
+      g_atomic_int_set (&osink->render_rect.x, x);
+	  osink->have_render_rect = true;
+      break;
+    case PROP_RENDER_Y:
+	  y = (int) g_value_get_uint (value);
+	  osink->render_rect_changed |= (old_rect.y!=y);
+      g_atomic_int_set (&osink->render_rect.y, y);
+	  osink->have_render_rect = true;
+      break;
+    case PROP_RENDER_W:
+	  w = (int) g_value_get_uint (value);
+	  osink->render_rect_changed |= (old_rect.w!=w);
+      g_atomic_int_set (&osink->render_rect.w, w);
+	  osink->have_render_rect = true;
+      break;
+    case PROP_RENDER_H:
+	  h = (int) g_value_get_uint (value);
+	  osink->render_rect_changed |= (old_rect.h!=h);
+      g_atomic_int_set (&osink->render_rect.h, h);
+	  osink->have_render_rect = true;
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      break;
+  }
+
+  if (osink->render_rect_changed)
+	check_render_rect(osink);
+}
+
+static void
+gst_omapfb_sink_get_property (GObject * object, guint prop_id,
+    GValue * value, GParamSpec * pspec)
+{
+  struct gst_omapfb_sink *osink;
+
+  g_return_if_fail (GST_IS_OMAPFBSINK (object));
+  osink = GST_OMAPFBSINK (object);
+
+  switch (prop_id) {
+    case PROP_RENDER_X:
+      g_value_set_boolean (value,
+          g_atomic_int_get (&osink->render_rect.x));
+      break;
+    case PROP_RENDER_Y:
+      g_value_set_boolean (value,
+          g_atomic_int_get (&osink->render_rect.y));
+      break;
+    case PROP_RENDER_W:
+      g_value_set_boolean (value,
+          g_atomic_int_get (&osink->render_rect.w));
+      break;
+    case PROP_RENDER_H:
+      g_value_set_boolean (value,
+          g_atomic_int_get (&osink->render_rect.h));
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      break;
+  }
+}
+
+static void
+gst_omapfb_sink_init (struct gst_omapfb_sink * omapfbsink)
+{
+  omapfbsink->render_rect.x = 0;
+  omapfbsink->render_rect.y = 0;
+  omapfbsink->render_rect.w = 0;
+  omapfbsink->render_rect.h = 0;
+  omapfbsink->have_render_rect = false;
+  omapfbsink->render_rect_changed = false;
+}
+
 GType
 gst_omapfb_sink_get_type(void)
 {
@@ -458,6 +658,8 @@ gst_omapfb_sink_get_type(void)
 			.class_init = class_init,
 			.base_init = base_init,
 			.instance_size = sizeof(struct gst_omapfb_sink),
+			.n_preallocs = 0,
+			.instance_init = (GInstanceInitFunc) gst_omapfb_sink_init,
 		};
 
 		type = g_type_register_static(GST_TYPE_BASE_SINK, "GstOmapFbSink", &type_info, 0);

@@ -108,8 +108,8 @@ generate_sink_template(void)
 	caps = gst_caps_new_empty();
 
 	struc = gst_structure_new("video/x-raw-yuv",
-			"width", GST_TYPE_INT_RANGE, 16, 4096,
-			"height", GST_TYPE_INT_RANGE, 16, 4096,
+			"width", GST_TYPE_INT_RANGE, 16, 800,
+			"height", GST_TYPE_INT_RANGE, 16, 600,
 			"framerate", GST_TYPE_FRACTION_RANGE, 0, 1, 30, 1,
 			NULL);
 

@@ -74,6 +74,7 @@ struct gst_omapfb_sink {
 	unsigned char *framebuffer;
 	bool enabled;
 	bool manual_update;
+	GstCaps *caps;
 
 	/* target video rectangle */
 	GstVideoRectangle render_rect;
@@ -303,6 +304,11 @@ setup(struct gst_omapfb_sink *self, GstCaps *caps)
 {
 	GstStructure *structure;
 
+	if (self->caps)
+		gst_caps_unref(self->caps);
+
+	self->caps = gst_caps_copy(caps);
+
 	_varinfo = _varinfo;
 	structure = gst_caps_get_structure(caps, 0);
 
@@ -322,7 +328,7 @@ buffer_alloc(GstBaseSink *base, guint64 offset, guint size, GstCaps *caps, GstBu
 	struct gst_omapfb_sink *self = (struct gst_omapfb_sink *)base;
 	GstBuffer *buffer;
 
-	if (!self->enabled && !setup(self, caps))
+	if (!gst_caps_is_equal(self->caps, caps) && !setup(self, caps))
 		goto missing;
 
 	buffer = gst_buffer_new_and_alloc(size);
@@ -342,8 +348,6 @@ static gboolean
 setcaps(GstBaseSink *base, GstCaps *caps)
 {
 	struct gst_omapfb_sink *self = (struct gst_omapfb_sink *)base;
-	if (self->enabled)
-		return true;
 	return setup(self, caps);
 }
 
@@ -443,6 +447,10 @@ start_video(struct gst_omapfb_sink *self)
 static gboolean
 stop_video(struct gst_omapfb_sink* self)
 {
+	if (self->caps)
+		gst_caps_unref(self->caps);
+
+	self->caps = NULL;
 
 	if (self->enabled) {
 		self->enabled = false;
@@ -728,6 +736,7 @@ gst_omapfb_sink_init (struct gst_omapfb_sink * omapfbsink)
   omapfbsink->have_render_rect = false;
   omapfbsink->render_rect_changed = false;
   omapfbsink->overlay_fd = 0;
+  omapfbsink->caps = NULL;
   hide_framebuffer(omapfbsink, "/dev/fb1");
   hide_framebuffer(omapfbsink, "/dev/fb2");
 }
